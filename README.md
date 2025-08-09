@@ -1,2 +1,2 @@
 Quick instruction: pip install streamlit
-streamlit run app.py
+then run streamlit run app.py
