@@ -155,23 +155,119 @@ class FlappyBallGame:
             column.draw(frame)
         cv2.putText(frame, f"Score: {self.score}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
+
+# ------------------- NEW STAR SHOOTER CLASSES -------------------
+class Star:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.size = 30
+        self.color = (255, 255, 0)  # Yellow star
+
+    def update(self, speed):
+        self.y += speed  # Move down
+
+    def draw(self, frame):
+        cv2.circle(frame, (int(self.x), int(self.y)), self.size, self.color, -1)
+        cv2.circle(frame, (int(self.x), int(self.y)), self.size, (0, 0, 0), 2)
+
+
+class Bullet:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.radius = 5
+        self.speed = 10
+        self.color = (0, 255, 255)  # Cyan bullet
+
+    def update(self):
+        self.y -= self.speed
+
+    def draw(self, frame):
+        cv2.circle(frame, (int(self.x), int(self.y)), self.radius, self.color, -1)
+
+
+class Player:
+    def __init__(self, screen_width, screen_height):
+        self.x = screen_width // 2
+        self.y = screen_height - 50
+        self.radius = 20
+        self.color = (0, 255, 0)  # Green player
+
+    def update_position(self, finger_x):
+        self.x = int(finger_x)
+
+    def draw(self, frame):
+        cv2.circle(frame, (self.x, self.y), self.radius, self.color, -1)
+
+
+class StarShooterGame:
+    def __init__(self, screen_width, screen_height):
+        self.player = Player(screen_width, screen_height)
+        self.star = Star(random.randint(50, screen_width - 50), 50)
+        self.bullets = []
+        self.score = 0
+        self.last_shot_time = time.time()
+        self.shot_interval = 0.5  # Shoot every 0.5 seconds
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+
+    def update(self):
+        # Update bullets
+        for bullet in self.bullets[:]:
+            bullet.update()
+            if bullet.y < 0:
+                self.bullets.remove(bullet)
+            else:
+                # Collision with star
+                if ((bullet.x - self.star.x) ** 2 + (bullet.y - self.star.y) ** 2) ** 0.5 < self.star.size:
+                    self.score += 10
+                    self.bullets.remove(bullet)
+                    self.star = Star(random.randint(50, self.screen_width - 50), 50)
+
+        # Move star down
+        self.star.update(2)
+        if self.star.y > self.screen_height:
+            self.star = Star(random.randint(50, self.screen_width - 50), 50)
+
+        # Auto-fire
+        if time.time() - self.last_shot_time > self.shot_interval:
+            self.bullets.append(Bullet(self.player.x, self.player.y - self.player.radius))
+            self.last_shot_time = time.time()
+
+    def update_player(self, finger_x):
+        self.player.update_position(finger_x)
+
+    def draw(self, frame):
+        self.player.draw(frame)
+        self.star.draw(frame)
+        for bullet in self.bullets:
+            bullet.draw(frame)
+        cv2.putText(frame, f"Score: {self.score}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+
 def main():
     st.title("🎮 Hand Tracking Games")
     
     # Game selection
     game_choice = st.selectbox(
         "Choose your game",
-        ["Flappy Ball", "Fruit Ninja"],
-        format_func=lambda x: f"🏐 {x}" if x == "Flappy Ball" else f"🥷 {x}"
-    )
+        ["Flappy Ball", "Fruit Ninja", "Star Shooter"],
+        format_func=lambda x: (
+            f"🏐 {x}" if x == "Flappy Ball" else
+            f"🥷 {x}" if x == "Fruit Ninja" else
+            f"⭐ {x}"
+        ))
     
     # Initialize session state based on game choice
     if 'game' not in st.session_state or 'current_game' not in st.session_state or st.session_state.current_game != game_choice:
         st.session_state.current_game = game_choice
         if game_choice == "Flappy Ball":
             st.session_state.game = FlappyBallGame(screen_height=480)
-        else:
+        elif game_choice == "Fruit Ninja":
             st.session_state.game = FruitNinjaGame()
+        else:
+            st.session_state.game = StarShooterGame(screen_width=640, screen_height=480)
     
     # Display game instructions
     if game_choice == "Flappy Ball":
@@ -180,12 +276,14 @@ def main():
         st.write("Move your hand to slice the falling fruits!")
     
     # Sidebar controls
-    st.sidebar.title("Game Controls")
     if st.sidebar.button("Reset Game"):
         if game_choice == "Flappy Ball":
             st.session_state.game = FlappyBallGame(screen_height=480)
-        else:
+        elif game_choice == "Fruit Ninja":
             st.session_state.game = FruitNinjaGame()
+        else:
+            st.session_state.game = StarShooterGame(screen_width=640, screen_height=480)
+
     
     confidence_threshold = st.sidebar.slider("Hand Detection Confidence", 0.1, 1.0, 0.7)
     
@@ -218,39 +316,48 @@ def main():
                 if game_choice == "Flappy Ball":
                     game.spawn_column(screen_width=width)
                     game.update_columns()
-                else:
+                elif game_choice == "Fruit Ninja":
                     game.spawn_fruit(width)
                     game.update_fruits(height)
+                else:  # Star Shooter
+                    game.update()
                 
                 # Hand tracking
                 if results.multi_hand_landmarks:
                     for hand_landmarks in results.multi_hand_landmarks:
                         index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+                        finger_x = int(index_tip.x * width)
                         finger_y = int(index_tip.y * height)
-                        
+
                         if game_choice == "Flappy Ball":
                             game.update_ball(finger_y)
                             cv2.circle(frame, (100, finger_y), 10, (0, 255, 0), -1)
-                        else:
-                            hand_x = int(index_tip.x * width)
-                            game.update_trail(hand_x, finger_y)
-                            game.check_slicing(hand_x, finger_y)
+                        elif game_choice == "Fruit Ninja":
+                            game.update_trail(finger_x, finger_y)
+                            game.check_slicing(finger_x, finger_y)
                             mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                            cv2.circle(frame, (hand_x, finger_y), 10, (0, 255, 0), -1)
+                            cv2.circle(frame, (finger_x, finger_y), 10, (0, 255, 0), -1)
+                        else:  # Star Shooter
+                            game.update_player(finger_x)
+                            cv2.circle(frame, (finger_x, height - 50), 10, (0, 255, 0), -1)
+
                 
                 # Game-specific updates
                 if game_choice == "Flappy Ball":
                     if game.check_collision():
                         cv2.putText(frame, "Game Over!", (width // 2 - 100, height // 2),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
                         cap.release()
                         break
                     game.draw(frame)
-                else:
+                elif game_choice == "Fruit Ninja":
                     game.draw_trail(frame)
                     game.draw_fruits(frame)
                     cv2.putText(frame, 'Point with index finger to slice!', (10, height - 20),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                else:  # Star Shooter
+                    game.draw(frame)
+
                 
                 # Display score and frame
                 score_placeholder.metric("Score", game.score)
