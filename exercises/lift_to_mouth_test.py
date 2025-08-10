@@ -74,6 +74,51 @@ def detect_on_frame(model, frame_bgr, class_filter, conf, imgsz, device):
         out.append((x1, y1, x2, y2, cls_id, score))
     return out
 
+def process_frame(frame, model, hands, face, pose, mouth_scale=0.8):
+    """Process single frame and return bottle position and reach status"""
+    h, w = frame.shape[:2]
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    # Process face and pose
+    face_results = face.process(img_rgb)
+    pose_results = pose.process(img_rgb)
+    
+    # Get mouth position and ear distance
+    mouth_center = None
+    ear_dist = None
+    bottle_pos = None
+    reached = False
+    
+    if face_results.multi_face_landmarks:
+        landmarks = face_results.multi_face_landmarks[0].landmark
+        upper = landmarks[13]  # Upper lip
+        lower = landmarks[14]  # Lower lip
+        mouth_center = (
+            int((upper.x + lower.x) * w / 2),
+            int((upper.y + lower.y) * h / 2)
+        )
+    
+    if pose_results.pose_landmarks:
+        lms = pose_results.pose_landmarks.landmark
+        l_ear = lms[mp_pose.PoseLandmark.LEFT_EAR]
+        r_ear = lms[mp_pose.PoseLandmark.RIGHT_EAR]
+        l_ear_px = to_pixels(l_ear, w, h)
+        r_ear_px = to_pixels(r_ear, w, h)
+        ear_dist = euclid(l_ear_px, r_ear_px)
+    
+    # Detect bottle
+    detections = detect_on_frame(model, frame, TARGET_CLASS, CONF, IMG_SIZE, DEVICE)
+    for (x1, y1, x2, y2, cls_id, score) in detections:
+        bottle_pos = ((x1+x2)//2, (y1+y2)//2)
+        
+        if mouth_center and ear_dist:
+            thresh = mouth_scale * ear_dist
+            dist = euclid(bottle_pos, mouth_center)
+            reached = dist <= thresh
+            
+    return bottle_pos, reached
+
+
 def main():
     global REF_MODE
 
@@ -242,6 +287,7 @@ def main():
                 break
 
             # --- Reach-to-mouth check ---
+            reached = False
             if ear_dist and mouth_center_px and ref_pt:
                 thresh = mouth_scale * ear_dist
                 d_ref = euclid(ref_pt, mouth_center_px)
@@ -260,6 +306,7 @@ def main():
                 if near:
                     cv2.putText(frame, "REACHED MOUTH", (w//2 - 170, 100),
                                 cv2.FONT_HERSHEY_TRIPLEX, 1.1, (0, 255, 0), 3)
+                    reached = True
 
             # HUD
             mode_text = f"Ref: {REF_MODE.upper()}  (1/2/3 or A=auto)   C=calibrate   Q=quit"

@@ -1,3 +1,12 @@
+# Reach-to-Mouth with Calibration (YOLO + MediaPipe)
+# Keys:
+#   1 = use bottle center as reference (default if bottle detected)
+#   2 = use RIGHT index fingertip as reference
+#   3 = use LEFT  index fingertip as reference
+#   C = calibrate threshold from current reference→mouth distance (normalized by head width)
+#   Q = quit
+# pip install ultralytics opencv-python mediapipe
+
 import cv2
 import time
 import math
@@ -7,30 +16,36 @@ from ultralytics import YOLO
 import mediapipe as mp
 
 # -------- CONFIG --------
-MODEL_PATH   = "yolov10b.pt"
-CONF         = 0.50
+MODEL_PATH   = "yolov10b.pt"   # or any YOLO model with "bottle" class
+CONF         = 0.50            # YOLO confidence
 IMG_SIZE     = 768
-DEVICE       = "mps"
+DEVICE       = "mps"           # 0 (CUDA), "cpu", "mps"
 HALF         = False
 CAM_INDEX    = 0
 FRAME_W      = 1280
 FRAME_H      = 720
-FLIP_VIEW    = True
-TARGET_CLASS = "bottle"
+FLIP_VIEW    = True            # mirror preview (feels natural on laptops)
+TARGET_CLASS = "bottle"        # None = all classes
 IOU_NMS      = 0.50
 FPS_SMOOTH_N = 20
+HOLD_TIME_REQUIRED = 5
 
-# Hold-specific config
-HOLD_TIME_REQUIRED = 5.0  # seconds
-DEFAULT_MOUTH_SCALE = 0.80  # starting distance threshold
+# Calibration: distance threshold = mouth_scale * ear_distance
+DEFAULT_MOUTH_SCALE = 0.80     # starting guess; press C to personalize
 MIN_SCALE, MAX_SCALE = 0.10, 2.50
-POSITION_TOLERANCE = 0.2  # relative to head width
 
-# MediaPipe setup
-mp_hands = mp.solutions.hands
-mp_pose = mp.solutions.pose
-mp_mesh = mp.solutions.face_mesh
-mp_draw = mp.solutions.drawing_utils
+# Reference selector
+REF_MODE = "auto"              # "auto" | "bottle" | "right_index" | "left_index"
+
+# ------------------------
+
+cv2.setUseOptimized(True)
+
+# MediaPipe
+mp_hands  = mp.solutions.hands
+mp_pose   = mp.solutions.pose
+mp_mesh   = mp.solutions.face_mesh
+mp_draw   = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
 
 def to_pixels(landmark, width, height):
@@ -39,52 +54,70 @@ def to_pixels(landmark, width, height):
 def euclid(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
+def clamp_box(x1, y1, x2, y2, w, h):
+    x1 = max(0, min(w-1, x1)); y1 = max(0, min(h-1, y1))
+    x2 = max(0, min(w-1, x2)); y2 = max(0, min(h-1, y2))
+    if x2 < x1: x1, x2 = x2, x1
+    if y2 < y1: y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
 def detect_on_frame(model, frame_bgr, class_filter, conf, imgsz, device):
+    """Returns list of (x1,y1,x2,y2, cls_id, score)."""
+    h, w = frame_bgr.shape[:2]
     res = model.predict(source=frame_bgr, imgsz=imgsz, conf=conf, device=device,
-                       verbose=False, classes=class_filter)[0]
+                        verbose=False, classes=class_filter)[0]
     out = []
     if res.boxes is None: return out
-    h, w = frame_bgr.shape[:2]
     for b in res.boxes:
         cls_id = int(b.cls[0]); score = float(b.conf[0])
         x1, y1, x2, y2 = map(int, b.xyxy[0].cpu().numpy())
+        x1, y1, x2, y2 = clamp_box(x1, y1, x2, y2, w, h)
         out.append((x1, y1, x2, y2, cls_id, score))
     return out
 
-def main():
-    print("🦷 Hold at Mouth Test")
-    print("Hold bottle at mouth level for 5 seconds")
-    print("Press 'c' to calibrate, 's' to start test")
 
-    # YOLO setup
+def main():
+    global REF_MODE
+
+    # YOLO
     model = YOLO(MODEL_PATH)
+    if HALF and DEVICE != "cpu":
+        try: model.fuse()
+        except Exception: pass
     names = model.names
+
+    # class filter
     class_filter = None
     if TARGET_CLASS:
         ids = [i for i, n in names.items() if str(n).lower() == TARGET_CLASS]
         if ids: class_filter = ids
+        else:   print(f'WARNING: class "{TARGET_CLASS}" not in model; running with all classes.')
 
-    # Camera setup
+    # Camera
     cap = cv2.VideoCapture(CAM_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if not cap.isOpened():
+        raise RuntimeError("Cannot open webcam")
 
-    # MediaPipe setup
-    face = mp_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, 
-                           refine_landmarks=True,
-                           min_detection_confidence=0.5)
-    pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
+    # MediaPipe
+    hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2, model_complexity=0,
+                           min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    pose  = mp_pose.Pose(static_image_mode=False, model_complexity=0, enable_segmentation=False,
+                         min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    face  = mp_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+                             min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-    # State tracking
+    # State
     mouth_scale = DEFAULT_MOUTH_SCALE
-    test_started = False
-    hold_start = None
-    initial_pos = None
-    max_deviation = 0
-    test_complete = False
-    fps_deque = deque(maxlen=FPS_SMOOTH_N)
-    prev_t = time.time()
+    last_near   = False
+    fps_deque   = deque(maxlen=FPS_SMOOTH_N)
+    prev_t      = time.time()
+
+    win = "Reach-to-Mouth (C to calibrate • 1/2/3 to pick ref)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     try:
         while True:
@@ -96,145 +129,182 @@ def main():
             h, w = frame.shape[:2]
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Process face and pose
-            face_results = face.process(img_rgb)
+            # --- MediaPipe: Hands, Pose (ears), Face (mouth) ---
+            hand_results = hands.process(img_rgb)
             pose_results = pose.process(img_rgb)
+            face_results = face.process(img_rgb)
 
-            # Get ear positions for scale
-            ear_dist = None
+            # Hands: index fingertips
+            right_index_px = left_index_px = None
+            if hand_results.multi_hand_landmarks:
+                for lms, handed in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
+                    # draw hand skeleton
+                    mp_draw.draw_landmarks(
+                        frame, lms, mp_hands.HAND_CONNECTIONS,
+                        mp_styles.get_default_hand_landmarks_style(),
+                        mp_styles.get_default_hand_connections_style()
+                    )
+                    idx_tip = lms.landmark[8]
+                    idx_px  = to_pixels(idx_tip, w, h)
+                    if handed.classification[0].label == "Right":
+                        right_index_px = idx_px
+                    else:
+                        left_index_px  = idx_px
+
+            # Pose: ears for scale
+            left_ear_px = right_ear_px = None
             if pose_results.pose_landmarks:
                 lms = pose_results.pose_landmarks.landmark
-                l_ear = lms[mp_pose.PoseLandmark.LEFT_EAR]
-                r_ear = lms[mp_pose.PoseLandmark.RIGHT_EAR]
-                l_ear_px = to_pixels(l_ear, w, h)
-                r_ear_px = to_pixels(r_ear, w, h)
-                ear_dist = euclid(l_ear_px, r_ear_px)
-                cv2.line(frame, l_ear_px, r_ear_px, (0,255,255), 2)
+                le_ar = lms[mp_pose.PoseLandmark.LEFT_EAR]
+                re_ar = lms[mp_pose.PoseLandmark.RIGHT_EAR]
+                if le_ar.visibility > 0.3 and re_ar.visibility > 0.3:
+                    left_ear_px  = to_pixels(le_ar, w, h)
+                    right_ear_px = to_pixels(re_ar, w, h)
+                    cv2.circle(frame, left_ear_px, 4, (255, 255, 0), -1)
+                    cv2.circle(frame, right_ear_px, 4, (255, 255, 0), -1)
+                    cv2.line(frame, left_ear_px, right_ear_px, (255, 255, 0), 2)
 
-            # Get mouth position
-            mouth_center = None
-            if face_results.multi_face_landmarks:
-                landmarks = face_results.multi_face_landmarks[0].landmark
+            ear_dist = None
+            if left_ear_px and right_ear_px:
+                ear_dist = euclid(left_ear_px, right_ear_px)
+                cv2.putText(frame, f"HeadW: {ear_dist:.0f}px  Scale: {mouth_scale:.2f}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 255, 220), 2)
+
+            # Face: mouth center
+            mouth_center_px = None
+            if face_results and face_results.multi_face_landmarks:
                 mp_draw.draw_landmarks(
                     image=frame,
                     landmark_list=face_results.multi_face_landmarks[0],
                     connections=mp_mesh.FACEMESH_LIPS,
                     landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_draw.DrawingSpec(color=(0,255,255))
+                    connection_drawing_spec=mp_draw.DrawingSpec(thickness=2, circle_radius=1)
                 )
-                upper = landmarks[13]  # Upper lip
-                lower = landmarks[14]  # Lower lip
-                mouth_x = int((upper.x + lower.x) * w / 2)
-                mouth_y = int((upper.y + lower.y) * h / 2)
-                mouth_center = (mouth_x, mouth_y)
-                cv2.circle(frame, mouth_center, 5, (0,255,255), -1)
+                lmsf = face_results.multi_face_landmarks[0].landmark
+                try:
+                    ux, uy = to_pixels(lmsf[13], w, h)  # upper inner lip
+                    lx, ly = to_pixels(lmsf[14], w, h)  # lower inner lip
+                    mouth_center_px = ((ux + lx)//2, (uy + ly)//2)
+                    cv2.circle(frame, mouth_center_px, 5, (0, 255, 255), -1)
+                except IndexError:
+                    pass
 
-            # Detect bottle
-            bottle_center = None
+            # --- YOLO: bottle ---
             detections = detect_on_frame(model, frame, class_filter, CONF, IMG_SIZE, DEVICE)
+            top_bottle_center = None
+            top_bottle_box = None
+            top_bottle_score = -1.0
             for (x1, y1, x2, y2, cls_id, score) in detections:
                 name = names.get(cls_id, str(cls_id))
-                if name.lower() == TARGET_CLASS:
-                    cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-                    bottle_center = ((x1+x2)//2, (y1+y2)//2)
+                color = (0, 255, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                label = f"{name} {score:.2f}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.6, 2)
+                y1t = max(0, y1 - th - 6)
+                cv2.rectangle(frame, (x1, y1t), (x1 + tw + 8, y1), color, -1)
+                cv2.putText(frame, label, (x1 + 4, y1 - 6),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                if score > top_bottle_score:
+                    top_bottle_score = score
+                    top_bottle_center = ((x1 + x2)//2, (y1 + y2)//2)
+                    top_bottle_box = (x1, y1, x2, y2)
 
-            # Test logic
-            if test_started and not test_complete and bottle_center and mouth_center and ear_dist:
-                thresh = mouth_scale * ear_dist
-                dist = euclid(bottle_center, mouth_center)
-                
-                # Visualize threshold
-                cv2.circle(frame, mouth_center, int(thresh), (0,200,255), 2)
-                cv2.line(frame, mouth_center, bottle_center, (0,200,255), 2)
-                
-                if dist <= thresh:
-                    if hold_start is None:
-                        hold_start = time.time()
-                        initial_pos = bottle_center
-                        print("Position acquired - hold steady!")
-                    else:
-                        hold_time = time.time() - hold_start
-                        
-                        # Check stability
-                        curr_deviation = euclid(bottle_center, initial_pos)
-                        max_deviation = max(max_deviation, curr_deviation)
-                        stability = max_deviation / ear_dist  # Normalize by head width
-                        
-                        # Draw timer
-                        remaining = max(0, HOLD_TIME_REQUIRED - hold_time)
-                        cv2.putText(frame, f"HOLD: {remaining:.1f}s", 
-                                  (w//2-100, 100), cv2.FONT_HERSHEY_TRIPLEX,
-                                  1.2, (0,255,0), 3)
-                        
-                        # Check completion
-                        if hold_time >= HOLD_TIME_REQUIRED:
-                            test_complete = True
-                            passed = stability <= POSITION_TOLERANCE
-                            
-                            print("\n===== HOLD AT MOUTH TEST =====")
-                            print(f"Hold Time: {hold_time:.1f}s")
-                            print(f"Stability: {stability:.3f} (relative to head width)")
-                            print("---------------------------")
-                            if passed:
-                                print("✅ TEST PASSED!")
-                            else:
-                                print("❌ TEST FAILED - Too much movement")
-                            print("---------------------------")
-                else:
-                    if hold_start:
-                        print("Position lost - realigning...")
-                    hold_start = None
-                    initial_pos = None
+            # --- Choose reference point ---
+            ref_pt = None
+            ref_label = None
+            if REF_MODE == "bottle" and top_bottle_center:
+                ref_pt = top_bottle_center; ref_label = "Bottle center"
+            elif REF_MODE == "right_index" and right_index_px:
+                ref_pt = right_index_px; ref_label = "Right index"
+            elif REF_MODE == "left_index" and left_index_px:
+                ref_pt = left_index_px; ref_label = "Left index"
+            else:
+                # auto mode: prefer bottle if present; else right index; else left index
+                if top_bottle_center:
+                    ref_pt = top_bottle_center; ref_label = "Bottle center"
+                elif right_index_px:
+                    ref_pt = right_index_px; ref_label = "Right index"
+                elif left_index_px:
+                    ref_pt = left_index_px; ref_label = "Left index"
 
-            # Key handling
+            # --- Keyboard input ---
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('s') and not test_started:
-                test_started = True
-                print("\nTest started! Align bottle with mouth.")
-            elif key == ord('c'):
-                if bottle_center and mouth_center and ear_dist:
-                    curr_dist = euclid(bottle_center, mouth_center)
-                    mouth_scale = curr_dist / ear_dist
-                    mouth_scale = max(MIN_SCALE, min(MAX_SCALE, mouth_scale))
-                    print(f"\nCalibrated! New scale: {mouth_scale:.2f}")
-            elif key == ord('r'):
-                test_started = False
-                hold_start = None
-                initial_pos = None
-                max_deviation = 0
-                test_complete = False
-                print("\nTest reset. Press 's' to start again.")
+            if key == ord('1'): REF_MODE = "bottle"
+            elif key == ord('2'): REF_MODE = "right_index"
+            elif key == ord('3'): REF_MODE = "left_index"
+            elif key in (ord('a'), ord('A')): REF_MODE = "auto"
+            elif key in (ord('c'), ord('C')):
+                if ear_dist and mouth_center_px and ref_pt:
+                    d = euclid(ref_pt, mouth_center_px)
+                    mouth_scale = max(MIN_SCALE, min(MAX_SCALE, d / ear_dist))
+                    print(f"[Calibrated] mouth_scale = {mouth_scale:.3f} (threshold = {mouth_scale:.3f} × head width)")
+                else:
+                    print("Calibration needs ears, mouth, and a reference point.")
             elif key == ord('q'):
                 break
 
-            # Status display
-            if not test_started:
-                status = "Press 'c' to calibrate, 's' to start test"
-            elif test_complete:
-                status = "Test complete - press 'r' to retry"
-            elif hold_start:
-                status = "HOLDING - Keep steady!"
-            else:
-                status = "Align bottle with mouth"
-            cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                       0.7, (0,200,200), 2)
+            # --- Reach-to-mouth check ---
+            reached = False
+            if ear_dist and mouth_center_px and ref_pt:
+                thresh = mouth_scale * ear_dist
+                d_ref = euclid(ref_pt, mouth_center_px)
+                near = d_ref <= thresh
 
-            # FPS counter
+                # Visualize
+                cv2.circle(frame, mouth_center_px, int(thresh), (0, 200, 255), 2)
+                cv2.line(frame, mouth_center_px, ref_pt, (0, 200, 255), 2)
+                cv2.putText(frame, f"{ref_label or 'Ref'}→Mouth: {d_ref:.0f}/{thresh:.0f}px",
+                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2)
+
+                if near and not last_near:
+                    print("Reached mouth!")
+                last_near = near
+
+                if near:
+                    current_time = time.time()
+                    if hold_start_time is None:
+                        hold_start_time = current_time
+                    
+                    elapsed = current_time - hold_start_time
+                    remaining = max(0, HOLD_TIME_REQUIRED - elapsed)
+                    
+                    if remaining > 0:
+                        # Show countdown
+                        cv2.putText(frame, f"HOLD: {remaining:.1f}s", (w//2 - 170, 100),
+                                  cv2.FONT_HERSHEY_TRIPLEX, 1.1, (0, 255, 0), 3)
+                    else:
+                        # Task complete
+                        cv2.putText(frame, "TASK COMPLETE!", (w//2 - 170, 100),
+                                  cv2.FONT_HERSHEY_TRIPLEX, 1.1, (0, 255, 0), 3)
+                        print("\n===== HOLD AT MOUTH TEST =====")
+                        print("✅ Successfully held position for 5 seconds!")
+                        print("---------------------------")
+                else:
+                    # Reset timer if position lost
+                    hold_start_time = None
+    
+
+            # HUD
+            mode_text = f"Ref: {REF_MODE.upper()}  (1/2/3 or A=auto)   C=calibrate   Q=quit"
+            cv2.putText(frame, mode_text, (10, 30), cv2.FONT_HERSHEY_DUPLEX, 0.75, (220, 255, 220), 2)
+
+            # FPS
             now = time.time()
-            fps = 1.0 / max(1e-6, now - prev_t)
+            fps = 1.0 / max(1e-6, (now - prev_t))
             prev_t = now
             fps_deque.append(fps)
             fps_avg = sum(fps_deque) / len(fps_deque)
-            cv2.putText(frame, f"{fps_avg:.1f} FPS", (10, h-20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+            cv2.putText(frame, f"{fps_avg:.1f} FPS", (w-150, 30),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 255, 180), 2)
 
-            cv2.imshow("Hold at Mouth Test", frame)
+            cv2.imshow(win, frame)
 
     finally:
-        face.close()
-        pose.close()
-        cap.release()
-        cv2.destroyAllWindows()
+        try:
+            hands.close(); pose.close(); face.close()
+        except Exception:
+            pass
+        cap.release(); cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
