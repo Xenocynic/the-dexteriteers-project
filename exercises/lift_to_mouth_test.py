@@ -36,6 +36,9 @@ MIN_SCALE, MAX_SCALE = 0.10, 2.50
 # Reference selector
 REF_MODE = "auto"              # "auto" | "bottle" | "right_index" | "left_index"
 
+# Lift test
+MAX_LIFT_TIME = 10.0  # seconds
+
 # ------------------------
 
 cv2.setUseOptimized(True)
@@ -119,12 +122,12 @@ def process_frame(frame, model, hands, face, pose, mouth_scale=0.8):
     return bottle_pos, reached
 
 
-def main():
+def lift(hand = "r"):
     global REF_MODE
 
     # YOLO
     model = YOLO(MODEL_PATH)
-    if HALF and DEVICE != "cpu":
+    if HALF and DEVICE != "mps":
         try: model.fuse()
         except Exception: pass
     names = model.names
@@ -161,6 +164,11 @@ def main():
 
     win = "Reach-to-Mouth (C to calibrate • 1/2/3 to pick ref)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+    # Add state variables
+    test_passed = False
+    hold_start_time = None
+    hold_duration = 2.0  # seconds to hold near mouth
 
     try:
         while True:
@@ -288,6 +296,7 @@ def main():
 
             # --- Reach-to-mouth check ---
             reached = False
+            near = False
             if ear_dist and mouth_center_px and ref_pt:
                 thresh = mouth_scale * ear_dist
                 d_ref = euclid(ref_pt, mouth_center_px)
@@ -308,6 +317,34 @@ def main():
                                 cv2.FONT_HERSHEY_TRIPLEX, 1.1, (0, 255, 0), 3)
                     reached = True
 
+            # --- Lift test ---
+            lift_complete = False  # Placeholder for actual lift detection logic
+            lift_time = 0.0  # Placeholder for actual lift time calculation
+            if lift_complete:
+                lift_passed = lift_time <= MAX_LIFT_TIME
+                print(f"\n{'='*60}")
+                print(f"{'✅ PASSED' if lift_passed else '❌ FAILED'} ⬆️")
+                print(f"{'='*60}")
+                print(f"Time to Lift: {lift_time:.3f}s (max {MAX_LIFT_TIME}s)")
+                print(f"{'='*60}")
+
+            if near and not test_passed:
+                test_passed = True
+                print("\n===== LIFT TEST =====")
+                print("✅ PASSED!")
+                print("Successfully lifted to face level")
+                print("===================")
+                
+                # Exit immediately upon success
+                time.sleep(1)
+                try:
+                    hands.close(); pose.close(); face.close()
+                except Exception:
+                    pass
+                cap.release()
+                cv2.destroyAllWindows()
+                return 1
+                
             # HUD
             mode_text = f"Ref: {REF_MODE.upper()}  (1/2/3 or A=auto)   C=calibrate   Q=quit"
             cv2.putText(frame, mode_text, (10, 30), cv2.FONT_HERSHEY_DUPLEX, 0.75, (220, 255, 220), 2)
@@ -329,6 +366,6 @@ def main():
         except Exception:
             pass
         cap.release(); cv2.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+        
+    # Return binary value based on whether test was passed
+    return 1 if test_passed else 0
